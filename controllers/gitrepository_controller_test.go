@@ -844,7 +844,7 @@ func TestGitRepositoryReconciler_reconcileInclude(t *testing.T) {
 			},
 			wantErr: true,
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.IncludeUnavailableCondition, "NotFound", "Could not get resource for include \"a\": gitrepositories.source.toolkit.fluxcd.io \"a\" not found"),
+				*conditions.TrueCondition(sourcev1.IncludeUnavailableCondition, "NotFound", "Could not get resource for include 'a': gitrepositories.source.toolkit.fluxcd.io \"a\" not found"),
 			},
 		},
 		{
@@ -862,7 +862,7 @@ func TestGitRepositoryReconciler_reconcileInclude(t *testing.T) {
 				{name: "a", toPath: "a/"},
 			},
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.IncludeUnavailableCondition, "NoArtifact", "No artifact available for include \"a\""),
+				*conditions.TrueCondition(sourcev1.IncludeUnavailableCondition, "NoArtifact", "No artifact available for include 'a'"),
 			},
 		},
 		{
@@ -1046,7 +1046,7 @@ func TestGitRepositoryReconciler_verifyCommitSignature(t *testing.T) {
 			},
 			want: ctrl.Result{RequeueAfter: interval},
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.SourceVerifiedCondition, meta.SucceededReason, "Verified signature of commit \"shasum\""),
+				*conditions.TrueCondition(sourcev1.SourceVerifiedCondition, meta.SucceededReason, "Verified signature of commit 'shasum'"),
 			},
 		},
 		{
@@ -1072,7 +1072,7 @@ func TestGitRepositoryReconciler_verifyCommitSignature(t *testing.T) {
 			},
 			wantErr: true,
 			assertConditions: []metav1.Condition{
-				*conditions.FalseCondition(sourcev1.SourceVerifiedCondition, meta.FailedReason, "Signature verification of commit \"shasum\" failed: failed to verify commit with any of the given key rings"),
+				*conditions.FalseCondition(sourcev1.SourceVerifiedCondition, meta.FailedReason, "Signature verification of commit 'shasum' failed: failed to verify commit with any of the given key rings"),
 			},
 		},
 		{
