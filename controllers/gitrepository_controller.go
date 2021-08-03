@@ -217,7 +217,7 @@ func (r *GitRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.G
 	// Reconcile the source from upstream
 	var artifact sourcev1.Artifact
 	if result, err := r.reconcileSource(ctx, obj, &artifact, tmpDir); err != nil || result.IsZero() {
-		return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, err
+		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, err
 	}
 
 	// Reconcile includes from the storage
@@ -231,7 +231,7 @@ func (r *GitRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.G
 		return result, err
 	}
 
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // reconcileStorage ensures the current state of the storage matches the desired and previously observed state.
@@ -264,7 +264,7 @@ func (r *GitRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sou
 	r.Storage.SetArtifactURL(obj.GetArtifact())
 	obj.Status.URL = r.Storage.SetHostname(obj.Status.URL)
 
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // reconcileSource ensures the upstream Git repository can be reached and checked out using the declared configuration,
@@ -361,7 +361,7 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 	if !obj.GetArtifact().HasRevision(commit.String()) {
 		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "NewRevision", "New upstream revision '%s'", commit.String())
 	}
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // reconcileArtifact archives a new artifact to the storage, if the current observation on the object does not match the
@@ -391,7 +391,7 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 	// The artifact is up-to-date
 	if obj.GetArtifact().HasRevision(artifact.Revision) && !includes.Diff(obj.Status.IncludedArtifacts) {
 		ctrl.LoggerFrom(ctx).Info("Artifact is up-to-date")
-		return ctrl.Result{RequeueAfter: obj.GetInterval().Duration}, nil
+		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 	}
 
 	// Ensure target path exists and is a directory
@@ -451,7 +451,7 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 	if url != "" {
 		obj.Status.URL = url
 	}
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // reconcileInclude reconciles the declared includes from the object by copying their artifact (sub)contents to the
@@ -506,7 +506,7 @@ func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sou
 	if artifacts.Diff(obj.Status.IncludedArtifacts) {
 		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "IncludeChange", "Included artifacts differ from last observed includes")
 	}
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // reconcileDelete handles the delete of an object. It first garbage collects all artifacts for the object from the
@@ -530,7 +530,7 @@ func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj
 	// Check if there is a commit verification is configured and remove any old observations if there is none
 	if obj.Spec.Verification == nil || obj.Spec.Verification.Mode == "" {
 		conditions.Delete(obj, sourcev1.SourceVerifiedCondition)
-		return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 	}
 
 	// Get secret with GPG data
@@ -559,7 +559,7 @@ func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj
 
 	conditions.MarkTrue(obj, sourcev1.SourceVerifiedCondition, meta.SucceededReason, "Verified signature of commit '%s'", commit.Hash.String())
 	r.Eventf(ctx, obj, events.EventSeverityInfo, "VerifiedCommit", "Verified signature of commit '%s'", commit.Hash.String())
-	return ctrl.Result{RequeueAfter: obj.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
 }
 
 // garbageCollect performs a garbage collection for the given v1beta1.GitRepository. It removes all but the current
