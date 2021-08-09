@@ -299,7 +299,7 @@ func TestGitRepositoryReconciler_reconcileSource_authStrategy(t *testing.T) {
 			},
 			wantErr: true,
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.CheckoutFailedCondition, sourcev1.GitOperationFailedReason, "x509: certificate signed by unknown authority"),
+				*conditions.TrueCondition(sourcev1.FetchFailedCondition, sourcev1.GitOperationFailedReason, "x509: certificate signed by unknown authority"),
 			},
 		},
 		{
@@ -324,7 +324,7 @@ func TestGitRepositoryReconciler_reconcileSource_authStrategy(t *testing.T) {
 			},
 			wantErr: true,
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.CheckoutFailedCondition, sourcev1.GitOperationFailedReason, "Failed to checkout and determine revision: unable to clone: Certificate"),
+				*conditions.TrueCondition(sourcev1.FetchFailedCondition, sourcev1.GitOperationFailedReason, "Failed to checkout and determine revision: unable to clone: Certificate"),
 			},
 		},
 		{
@@ -385,7 +385,7 @@ func TestGitRepositoryReconciler_reconcileSource_authStrategy(t *testing.T) {
 			},
 			wantErr: true,
 			assertConditions: []metav1.Condition{
-				*conditions.TrueCondition(sourcev1.CheckoutFailedCondition, "AuthenticationFailed", "Failed to get secret '/non-existing': secrets \"non-existing\" not found"),
+				*conditions.TrueCondition(sourcev1.FetchFailedCondition, sourcev1.AuthenticationFailedReason, "Failed to get secret '/non-existing': secrets \"non-existing\" not found"),
 			},
 		},
 	}
@@ -1250,7 +1250,7 @@ func TestGitRepositoryReconciler_ConditionsUpdate(t *testing.T) {
 		{
 			name: "mixed failed conditions",
 			beforeFunc: func(obj *sourcev1.GitRepository) {
-				conditions.MarkTrue(obj, sourcev1.CheckoutFailedCondition, "Foo", "")
+				conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, "Foo", "")
 				conditions.MarkTrue(obj, sourcev1.IncludeUnavailableCondition, "Foo", "")
 				conditions.MarkTrue(obj, sourcev1.SourceVerifiedCondition, "Foo", "")
 				conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "Foo", "")
@@ -1265,7 +1265,7 @@ func TestGitRepositoryReconciler_ConditionsUpdate(t *testing.T) {
 			name: "reconciling and failed conditions",
 			beforeFunc: func(obj *sourcev1.GitRepository) {
 				conditions.MarkTrue(obj, meta.ReconcilingCondition, "Foo", "")
-				conditions.MarkTrue(obj, sourcev1.CheckoutFailedCondition, "Foo", "")
+				conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, "Foo", "")
 			},
 			want: ctrl.Result{RequeueAfter: interval},
 			assertConditions: []metav1.Condition{
@@ -1276,7 +1276,7 @@ func TestGitRepositoryReconciler_ConditionsUpdate(t *testing.T) {
 			name: "stalled and failed conditions",
 			beforeFunc: func(obj *sourcev1.GitRepository) {
 				conditions.MarkTrue(obj, meta.StalledCondition, "Foo", "")
-				conditions.MarkTrue(obj, sourcev1.CheckoutFailedCondition, "Foo", "")
+				conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, "Foo", "")
 			},
 			want: ctrl.Result{RequeueAfter: interval},
 			assertConditions: []metav1.Condition{
