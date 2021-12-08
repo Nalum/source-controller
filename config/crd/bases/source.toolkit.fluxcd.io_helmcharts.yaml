@@ -132,6 +132,9 @@ spec:
               observedGeneration: -1
             description: HelmChartStatus defines the observed state of the HelmChart.
             properties:
+              ObservedSourceArtifactRevision:
+                description: ObservedSourceArtifactRevision is the last observed Artifact.Revision of the Source reference.
+                type: string
               artifact:
                 description: Artifact represents the output of the last successful chart sync.
                 properties:
@@ -201,6 +204,9 @@ spec:
                 type: array
               lastHandledReconcileAt:
                 description: LastHandledReconcileAt holds the value of the most recent reconcile request value, so a change of the annotation value can be detected.
+                type: string
+              observedChartName:
+                description: ObservedChartName is the last observed chart name as defined by the resolved chart reference.
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the last observed generation.

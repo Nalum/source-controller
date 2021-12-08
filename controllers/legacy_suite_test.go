@@ -126,7 +126,6 @@ var _ = BeforeSuite(func(done Done) {
 
 	err = (&HelmChartReconciler{
 		Client:  k8sManager.GetClient(),
-		Scheme:  scheme.Scheme,
 		Storage: ginkgoTestStorage,
 		Getters: getter.Providers{getter.Provider{
 			Schemes: []string{"http", "https"},

@@ -30,6 +30,7 @@ import (
 	"github.com/fluxcd/pkg/apis/meta"
 	"github.com/fluxcd/pkg/gittestserver"
 	"github.com/fluxcd/pkg/helmtestserver"
+	"github.com/fluxcd/pkg/runtime/conditions"
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -270,7 +271,7 @@ var _ = Describe("HelmChartReconciler", func() {
 				got := &sourcev1.HelmChart{}
 				Eventually(func() bool {
 					_ = k8sClient.Get(context.Background(), key, got)
-					return got.Status.ObservedGeneration > updated.Status.ObservedGeneration &&
+					return got.Status.ObservedGeneration > updated.Status.ObservedGeneration && got.GetArtifact() != nil &&
 						ginkgoTestStorage.ArtifactExist(*got.Status.Artifact)
 				}, timeout, interval).Should(BeTrue())
 				f, err := os.Stat(ginkgoTestStorage.LocalPath(*got.Status.Artifact))
@@ -394,12 +395,8 @@ var _ = Describe("HelmChartReconciler", func() {
 			Expect(k8sClient.Update(context.Background(), chart)).Should(Succeed())
 			Eventually(func() bool {
 				_ = k8sClient.Get(context.Background(), key, chart)
-				for _, c := range chart.Status.Conditions {
-					if c.Reason == sourcev1.ChartPullFailedReason {
-						return true
-					}
-				}
-				return false
+				return conditions.GetReason(chart, sourcev1.FetchFailedCondition) == "InvalidChartReference" &&
+					conditions.IsStalled(chart)
 			}, timeout, interval).Should(BeTrue())
 			Expect(chart.GetArtifact()).NotTo(BeNil())
 			Expect(chart.Status.Artifact.Revision).Should(Equal("0.1.1"))
@@ -495,13 +492,7 @@ var _ = Describe("HelmChartReconciler", func() {
 			got := &sourcev1.HelmChart{}
 			Eventually(func() bool {
 				_ = k8sClient.Get(context.Background(), key, got)
-				for _, c := range got.Status.Conditions {
-					if c.Reason == sourcev1.AuthenticationFailedReason &&
-						strings.Contains(c.Message, "auth secret error") {
-						return true
-					}
-				}
-				return false
+				return conditions.GetReason(got, sourcev1.FetchFailedCondition) == sourcev1.AuthenticationFailedReason
 			}, timeout, interval).Should(BeTrue())
 
 			By("Applying secret with missing keys")
