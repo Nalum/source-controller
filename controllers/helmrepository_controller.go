@@ -27,7 +27,6 @@ import (
 	helmgetter "helm.sh/helm/v3/pkg/getter"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,8 +43,10 @@ import (
 	"github.com/fluxcd/pkg/runtime/predicates"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
+	serror "github.com/fluxcd/source-controller/internal/error"
 	"github.com/fluxcd/source-controller/internal/helm/getter"
 	"github.com/fluxcd/source-controller/internal/helm/repository"
+	sreconcile "github.com/fluxcd/source-controller/internal/reconcile"
 )
 
 // +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=helmrepositories,verbs=get;list;watch;create;update;patch;delete
@@ -66,6 +67,11 @@ type HelmRepositoryReconciler struct {
 type HelmRepositoryReconcilerOptions struct {
 	MaxConcurrentReconciles int
 }
+
+// helmRepoReconcilerFunc is the function type for all the helm repository
+// reconciler functions. The reconciler functions are grouped together and
+// executed serially to perform the main operation of the reconciler.
+type helmRepoReconcilerFunc func(ctx context.Context, obj *sourcev1.HelmRepository, artifact *sourcev1.Artifact, repo *repository.ChartRepository) (sreconcile.Result, error)
 
 func (r *HelmRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return r.SetupWithManagerAndOptions(mgr, HelmRepositoryReconcilerOptions{})
@@ -104,71 +110,15 @@ func (r *HelmRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Always attempt to patch the object and status after each reconciliation
+	// Result of the sub-reconciliation.
+	var recResult sreconcile.Result
+
+	// Always attempt to patch the object after each reconciliation.
+	// NOTE: This deferred block only modifies the named return error. The
+	// result from the reconciliation remains the same. Any requeue attributes
+	// set in the result will continue to be effective.
 	defer func() {
-		// Record the value of the reconciliation request, if any
-		if v, ok := meta.ReconcileAnnotationValue(obj.GetAnnotations()); ok {
-			obj.Status.SetLastHandledReconcileRequest(v)
-		}
-
-		// Summarize Ready condition
-		conditions.SetSummary(obj,
-			meta.ReadyCondition,
-			conditions.WithConditions(
-				sourcev1.FetchFailedCondition,
-				sourcev1.ArtifactOutdatedCondition,
-				sourcev1.ArtifactUnavailableCondition,
-			),
-			conditions.WithNegativePolarityConditions(
-				sourcev1.FetchFailedCondition,
-				sourcev1.ArtifactOutdatedCondition,
-				sourcev1.ArtifactUnavailableCondition,
-			),
-		)
-
-		// Patch the object, ignoring conflicts on the conditions owned by this controller
-		patchOpts := []patch.Option{
-			patch.WithOwnedConditions{
-				Conditions: []string{
-					sourcev1.FetchFailedCondition,
-					sourcev1.ArtifactOutdatedCondition,
-					sourcev1.ArtifactUnavailableCondition,
-					meta.ReadyCondition,
-					meta.ReconcilingCondition,
-					meta.StalledCondition,
-				},
-			},
-		}
-
-		// Determine if the resource is still being reconciled, or if it has stalled, and record this observation
-		if retErr == nil && (result.IsZero() || !result.Requeue) {
-			// We are no longer reconciling
-			conditions.Delete(obj, meta.ReconcilingCondition)
-
-			// We have now observed this generation
-			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
-
-			readyCondition := conditions.Get(obj, meta.ReadyCondition)
-			switch readyCondition.Status {
-			case metav1.ConditionFalse:
-				// As we are no longer reconciling and the end-state
-				// is not ready, the reconciliation has stalled
-				conditions.MarkStalled(obj, readyCondition.Reason, readyCondition.Message)
-			case metav1.ConditionTrue:
-				// As we are no longer reconciling and the end-state
-				// is ready, the reconciliation is no longer stalled
-				conditions.Delete(obj, meta.StalledCondition)
-			}
-		}
-
-		// Finally, patch the resource
-		if err := patchHelper.Patch(ctx, obj, patchOpts...); err != nil {
-			// Ignore patch error "not found" when the object is being deleted.
-			if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
-				err = kerrors.FilterOut(err, func(e error) bool { return apierrors.IsNotFound(e) })
-			}
-			retErr = kerrors.NewAggregate([]error{retErr, err})
-		}
+		retErr = r.summarizeAndPatch(ctx, obj, patchHelper, recResult, retErr)
 
 		// Always record readiness and duration metrics
 		r.Metrics.RecordReadiness(ctx, obj)
@@ -179,53 +129,148 @@ func (r *HelmRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// between init and delete
 	if !controllerutil.ContainsFinalizer(obj, sourcev1.SourceFinalizer) {
 		controllerutil.AddFinalizer(obj, sourcev1.SourceFinalizer)
+		recResult = sreconcile.ResultRequeue
 		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Examine if the object is under deletion
 	if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, obj)
+		res, err := r.reconcileDelete(ctx, obj)
+		return sreconcile.BuildRuntimeResult(obj, res, err)
 	}
 
 	// Reconcile actual object
-	return r.reconcile(ctx, obj)
+	reconcilers := []helmRepoReconcilerFunc{
+		r.reconcileStorage,
+		r.reconcileSource,
+		r.reconcileArtifact,
+	}
+	recResult, err = r.reconcile(ctx, obj, reconcilers)
+	return sreconcile.BuildRuntimeResult(obj, recResult, err)
 }
 
-// reconcile steps through the actual reconciliation tasks for the object, it returns early on the first step that
-// produces an error.
-func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.HelmRepository) (ctrl.Result, error) {
-	// Mark the resource as under reconciliation
-	conditions.MarkReconciling(obj, meta.ProgressingReason, "")
+// summarizeAndPatch analyzes the object conditions to create a summary of the
+// status conditions and patches the object with the calculated summary. The
+// reconciler error type is also used to determine the conditions and the
+// returned error.
+func (r *HelmRepositoryReconciler) summarizeAndPatch(ctx context.Context, obj *sourcev1.HelmRepository, patchHelper *patch.Helper, res sreconcile.Result, recErr error) error {
+	// Remove reconciling condition on successful reconciliation.
+	if recErr == nil && res == sreconcile.ResultSuccess {
+		conditions.Delete(obj, meta.ReconcilingCondition)
+	}
 
-	// Reconcile the storage data
-	if result, err := r.reconcileStorage(ctx, obj); err != nil {
-		return result, err
+	// Record the value of the reconciliation request, if any
+	if v, ok := meta.ReconcileAnnotationValue(obj.GetAnnotations()); ok {
+		obj.Status.SetLastHandledReconcileRequest(v)
+	}
+
+	// Patch the object, ignoring conflicts on the conditions owned by this controller
+	patchOpts := []patch.Option{
+		patch.WithOwnedConditions{
+			Conditions: []string{
+				sourcev1.FetchFailedCondition,
+				sourcev1.ArtifactOutdatedCondition,
+				meta.ReadyCondition,
+				meta.ReconcilingCondition,
+				meta.StalledCondition,
+			},
+		},
+	}
+
+	// Analyze the reconcile error.
+	switch t := recErr.(type) {
+	case *serror.StallingError:
+		if res == sreconcile.ResultEmpty {
+			// The current generation has been reconciled successfully and it has
+			// resulted in a stalled state. Return no error to stop further
+			// requeuing.
+			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
+			conditions.MarkStalled(obj, t.Reason, t.Error())
+			recErr = nil
+		}
+		// ?: Log when there's a stalling error and non-empty result? This
+		// indicates incorrect returned values.
+	case nil:
+		// The reconcile didn't result in any error, we are not in stalled
+		// state. If a requeue is requested, the current generation has not been
+		// reconciled successfully.
+		if res != sreconcile.ResultRequeue {
+			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
+		}
+		conditions.Delete(obj, meta.StalledCondition)
+	default:
+		// The reconcile resulted in some error, but we are not in stalled
+		// state.
+		conditions.Delete(obj, meta.StalledCondition)
+	}
+
+	// Summarize Ready condition
+	conditions.SetSummary(obj,
+		meta.ReadyCondition,
+		conditions.WithConditions(
+			sourcev1.FetchFailedCondition,
+			sourcev1.ArtifactOutdatedCondition,
+			meta.StalledCondition,
+			meta.ReconcilingCondition,
+		),
+		conditions.WithNegativePolarityConditions(
+			sourcev1.FetchFailedCondition,
+			sourcev1.ArtifactOutdatedCondition,
+			meta.StalledCondition,
+			meta.ReconcilingCondition,
+		),
+	)
+
+	// Finally, patch the resource
+	if err := patchHelper.Patch(ctx, obj, patchOpts...); err != nil {
+		// Ignore patch error "not found" when the object is being deleted.
+		if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
+			err = kerrors.FilterOut(err, func(e error) bool { return apierrors.IsNotFound(e) })
+		}
+		recErr = kerrors.NewAggregate([]error{recErr, err})
+	}
+
+	return recErr
+}
+
+// reconcile iterates through the sub-reconcilers and processes the source
+// object. The sub-reconcilers are run sequentially. The result and error  of
+// the sub-reconciliation are collected and returned. For multiple results
+// from different sub-reconcilers, the results are combined to return the
+// result with the shortest requeue period.
+func (r *HelmRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.HelmRepository, reconcilers []helmRepoReconcilerFunc) (sreconcile.Result, error) {
+	if obj.Generation != obj.Status.ObservedGeneration {
+		conditions.MarkReconciling(obj, "NewGeneration", "Reconciling new generation %d", obj.Generation)
 	}
 
 	var chartRepo repository.ChartRepository
 	var artifact sourcev1.Artifact
-	// Reconcile the source from upstream
-	if result, err := r.reconcileSource(ctx, obj, &artifact, &chartRepo); err != nil || result.IsZero() {
-		return result, err
-	}
 
-	// Reconcile the artifact.
-	if result, err := r.reconcileArtifact(ctx, obj, artifact, &chartRepo); err != nil || result.IsZero() {
-		return result, err
+	// Run the sub-reconcilers and build the result of reconciliation.
+	var res sreconcile.Result
+	var resErr error
+	for _, rec := range reconcilers {
+		recResult, err := rec(ctx, obj, &artifact, &chartRepo)
+		// Exit immediately on ResultRequeue.
+		if recResult == sreconcile.ResultRequeue {
+			return sreconcile.ResultRequeue, nil
+		}
+		// Prioritize requeue request in the result.
+		res = sreconcile.LowestRequeuingResult(res, recResult)
+		if err != nil {
+			resErr = err
+			break
+		}
 	}
-
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return res, resErr
 }
 
 // reconcileStorage ensures the current state of the storage matches the desired and previously observed state.
 //
 // All artifacts for the resource except for the current one are garbage collected from the storage.
 // If the artifact in the Status object of the resource disappeared from storage, it is removed from the object.
-// If the object does not have an artifact in its Status object, a v1beta1.ArtifactUnavailableCondition is set.
 // If the hostname of any of the URLs on the object do not match the current storage server hostname, they are updated.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
-func (r *HelmRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sourcev1.HelmRepository) (ctrl.Result, error) {
+func (r *HelmRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sourcev1.HelmRepository, artifact *sourcev1.Artifact, chartRepo *repository.ChartRepository) (sreconcile.Result, error) {
 	// Garbage collect previous advertised artifact(s) from storage
 	_ = r.garbageCollect(ctx, obj)
 
@@ -237,17 +282,16 @@ func (r *HelmRepositoryReconciler) reconcileStorage(ctx context.Context, obj *so
 
 	// Record that we do not have an artifact
 	if obj.GetArtifact() == nil {
-		conditions.MarkTrue(obj, sourcev1.ArtifactUnavailableCondition, "NoArtifact", "No artifact for resource in storage")
-		return ctrl.Result{Requeue: true}, nil
+		conditions.MarkReconciling(obj, "NoArtifact", "No artifact for resource in storage")
+		return sreconcile.ResultSuccess, nil
 	}
-	conditions.Delete(obj, sourcev1.ArtifactUnavailableCondition)
 
 	// Always update URLs to ensure hostname is up-to-date
 	// TODO(hidde): we may want to send out an event only if we notice the URL has changed
 	r.Storage.SetArtifactURL(obj.GetArtifact())
 	obj.Status.URL = r.Storage.SetHostname(obj.Status.URL)
 
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileSource ensures the upstream Helm repository can be reached and downloaded out using the declared
@@ -255,11 +299,9 @@ func (r *HelmRepositoryReconciler) reconcileStorage(ctx context.Context, obj *so
 //
 // The Helm repository index is downloaded using the defined configuration, and in case of an error during this process
 // (including transient errors), it records v1beta1.FetchFailedCondition=True and returns early.
-// On a successful write of a new artifact, the artifact in the status of the given object is set, and the symlink in
-// the storage is updated to its path.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
-func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sourcev1.HelmRepository, artifact *sourcev1.Artifact, chartRepo *repository.ChartRepository) (ctrl.Result, error) {
+// If the download is successful, the given artifact pointer is set to a new artifact with the available metadata, and
+// the index pointer is set to the newly downloaded index.
+func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sourcev1.HelmRepository, artifact *sourcev1.Artifact, chartRepo *repository.ChartRepository) (sreconcile.Result, error) {
 	// Configure Helm client to access repository
 	clientOpts := []helmgetter.Option{
 		helmgetter.WithTimeout(obj.Spec.Timeout.Duration),
@@ -280,18 +322,16 @@ func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sou
 				"Failed to get secret '%s': %s", name.String(), err.Error())
 			r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.AuthenticationFailedReason,
 				"Failed to get secret '%s': %s", name.String(), err.Error())
-			// Return error as the world as observed may change
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 
 		// Get client options from secret
 		tmpDir, err := os.MkdirTemp("", fmt.Sprintf("%s-%s-auth-", obj.Name, obj.Namespace))
 		if err != nil {
-			conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, sourcev1.StorageOperationFailedReason,
-				"Failed to create temporary directory for credentials: %s", err.Error())
+			ctrl.LoggerFrom(ctx).Error(err, "failed to create temporary directory for credentials")
 			r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
 				"Failed to create temporary directory for credentials: %s", err.Error())
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 		defer os.RemoveAll(tmpDir)
 
@@ -302,8 +342,8 @@ func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sou
 				"Failed to configure Helm client with secret data: %s", err)
 			r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.AuthenticationFailedReason,
 				"Failed to configure Helm client with secret data: %s", err)
-			// Return err as the content of the secret may change
-			return ctrl.Result{}, err
+			// Return err as the content of the secret may change.
+			return sreconcile.ResultEmpty, err
 		}
 		clientOpts = append(clientOpts, opts...)
 	}
@@ -316,22 +356,20 @@ func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sou
 			ctrl.LoggerFrom(ctx).Error(err, "invalid Helm repository URL")
 			conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, sourcev1.URLInvalidReason,
 				"Invalid Helm repository URL: %s", err.Error())
-			return ctrl.Result{}, nil
+			return sreconcile.ResultEmpty, &serror.StallingError{Err: err, Reason: sourcev1.URLInvalidReason}
 		default:
 			ctrl.LoggerFrom(ctx).Error(err, "failed to construct Helm client")
 			conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, meta.FailedReason,
 				"Failed to construct Helm client: %s", err.Error())
-			return ctrl.Result{}, nil
+			return sreconcile.ResultEmpty, &serror.StallingError{Err: err, Reason: meta.FailedReason}
 		}
 	}
 	checksum, err := newChartRepo.CacheIndex()
 	if err != nil {
 		conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, meta.FailedReason,
 			"Failed to download Helm repository index: %s", err.Error())
-		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.FetchFailedCondition,
-			"Failed to download Helm repository index: %s", err.Error())
 		// Coin flip on transient or persistent error, return error and hope for the best
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	*chartRepo = *newChartRepo
 
@@ -341,14 +379,15 @@ func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sou
 			"Failed to load Helm repository from cache: %s", err.Error())
 		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.FetchFailedCondition,
 			"Failed to load Helm repository from cache: %s", err.Error())
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	defer chartRepo.Unload()
 
 	// Mark observations about the revision on the object.
 	if !obj.GetArtifact().HasRevision(checksum) {
-		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "NewRevision",
-			"New index revision '%s'", checksum)
+		message := fmt.Sprintf("New index revision '%s'", checksum)
+		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "NewRevision", message)
+		conditions.MarkReconciling(obj, "NewRevision", message)
 	}
 
 	conditions.Delete(obj, sourcev1.FetchFailedCondition)
@@ -359,15 +398,20 @@ func (r *HelmRepositoryReconciler) reconcileSource(ctx context.Context, obj *sou
 		chartRepo.Checksum,
 		fmt.Sprintf("index-%s.yaml", checksum))
 
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
-func (r *HelmRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *sourcev1.HelmRepository, artifact sourcev1.Artifact, chartRepo *repository.ChartRepository) (ctrl.Result, error) {
+// reconcileArtifact stores a new artifact in the storage, if the current observation on the object does not match the
+// given data.
+//
+// The inspection of the given data to the object is differed, ensuring any stale observations as
+// v1beta1.ArtifactUnavailableCondition and v1beta1.ArtifactOutdatedCondition are always deleted.
+// If the given artifact does not differ from the object's current, it returns early.
+// On a successful write of a new artifact, the artifact in the status of the given object is set, and the symlink in
+// the storage is updated to its path.
+func (r *HelmRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *sourcev1.HelmRepository, artifact *sourcev1.Artifact, chartRepo *repository.ChartRepository) (sreconcile.Result, error) {
 	// Always restore the Ready condition in case it got removed due to a transient error.
 	defer func() {
-		if obj.GetArtifact() != nil {
-			conditions.Delete(obj, sourcev1.ArtifactUnavailableCondition)
-		}
 		if obj.GetArtifact().HasRevision(artifact.Revision) {
 			conditions.Delete(obj, sourcev1.ArtifactOutdatedCondition)
 			conditions.MarkTrue(obj, meta.ReadyCondition, meta.SucceededReason,
@@ -377,38 +421,44 @@ func (r *HelmRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *s
 
 	if obj.GetArtifact().HasRevision(artifact.Revision) {
 		ctrl.LoggerFrom(ctx).Info(fmt.Sprintf("Already up to date, current revision '%s'", artifact.Revision))
-		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+		return sreconcile.ResultSuccess, nil
 	}
+
+	// Mark reconciling because the artifact and remote source are different.
+	// and they have to be reconciled.
+	conditions.MarkReconciling(obj, "NewRevision", "New index revision '%s'", artifact.Revision)
 
 	// Clear cache at the very end.
 	defer chartRepo.RemoveCache()
 
 	// Create artifact dir.
-	if err := r.Storage.MkdirAll(artifact); err != nil {
+	if err := r.Storage.MkdirAll(*artifact); err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "failed to create artifact directory")
-		return ctrl.Result{}, err
+		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
+			"Failed to create artifact directory: %s", err.Error())
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Acquire lock.
-	unlock, err := r.Storage.Lock(artifact)
+	unlock, err := r.Storage.Lock(*artifact)
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "failed to acquire lock for artifact")
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	defer unlock()
 
 	// Save artifact to storage.
-	if err = r.Storage.CopyFromPath(&artifact, chartRepo.CachePath); err != nil {
+	if err = r.Storage.CopyFromPath(artifact, chartRepo.CachePath); err != nil {
 		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
 			"Unable to save artifact to storage: %s", err)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Record it on the object.
 	obj.Status.Artifact = artifact.DeepCopy()
 
 	// Update index symlink.
-	indexURL, err := r.Storage.Symlink(artifact, "index.yaml")
+	indexURL, err := r.Storage.Symlink(*artifact, "index.yaml")
 	if err != nil {
 		r.Events.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
 			"Failed to update status URL symlink: %s", err)
@@ -417,23 +467,23 @@ func (r *HelmRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *s
 	if indexURL != "" {
 		obj.Status.URL = indexURL
 	}
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileDelete handles the delete of an object. It first garbage collects all artifacts for the object from the
 // artifact storage, if successful, the finalizer is removed from the object.
-func (r *HelmRepositoryReconciler) reconcileDelete(ctx context.Context, obj *sourcev1.HelmRepository) (ctrl.Result, error) {
+func (r *HelmRepositoryReconciler) reconcileDelete(ctx context.Context, obj *sourcev1.HelmRepository) (sreconcile.Result, error) {
 	// Garbage collect the resource's artifacts
 	if err := r.garbageCollect(ctx, obj); err != nil {
 		// Return the error so we retry the failed garbage collection
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Remove our finalizer from the list
 	controllerutil.RemoveFinalizer(obj, sourcev1.SourceFinalizer)
 
 	// Stop reconciliation as the object is being deleted
-	return ctrl.Result{}, nil
+	return sreconcile.ResultEmpty, nil
 }
 
 // garbageCollect performs a garbage collection for the given v1beta1.HelmRepository. It removes all but the current
