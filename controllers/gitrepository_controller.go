@@ -26,7 +26,6 @@ import (
 	securejoin "github.com/cyphar/filepath-securejoin"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,6 +44,8 @@ import (
 	"github.com/fluxcd/source-controller/pkg/sourceignore"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
+	serror "github.com/fluxcd/source-controller/internal/error"
+	sreconcile "github.com/fluxcd/source-controller/internal/reconcile"
 	"github.com/fluxcd/source-controller/pkg/git"
 	"github.com/fluxcd/source-controller/pkg/git/strategy"
 )
@@ -69,6 +70,10 @@ type GitRepositoryReconcilerOptions struct {
 	MaxConcurrentReconciles   int
 	DependencyRequeueInterval time.Duration
 }
+
+// gitRepoReconcilerFunc is the function type for all the Git repository
+// reconciler functions.
+type gitRepoReconcilerFunc func(ctx context.Context, obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, includes *artifactSet, dir string) (sreconcile.Result, error)
 
 func (r *GitRepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return r.SetupWithManagerAndOptions(mgr, GitRepositoryReconcilerOptions{})
@@ -110,74 +115,14 @@ func (r *GitRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	var recResult sreconcile.Result
+
 	// Always attempt to patch the object and status after each reconciliation
+	// NOTE: This deferred block only modifies the named return error. The
+	// result from the reconciliation remains the same. Any requeue attributes
+	// set in the result will continue to be effective.
 	defer func() {
-		// Record the value of the reconciliation request, if any
-		if v, ok := meta.ReconcileAnnotationValue(obj.GetAnnotations()); ok {
-			obj.Status.SetLastHandledReconcileRequest(v)
-		}
-
-		// Summarize the Ready condition based on abnormalities that may have been observed.
-		conditions.SetSummary(obj,
-			meta.ReadyCondition,
-			conditions.WithConditions(
-				sourcev1.IncludeUnavailableCondition,
-				sourcev1.SourceVerifiedCondition,
-				sourcev1.FetchFailedCondition,
-				sourcev1.ArtifactOutdatedCondition,
-				sourcev1.ArtifactUnavailableCondition,
-			),
-			conditions.WithNegativePolarityConditions(
-				sourcev1.ArtifactUnavailableCondition,
-				sourcev1.FetchFailedCondition,
-				sourcev1.IncludeUnavailableCondition,
-				sourcev1.ArtifactOutdatedCondition,
-			),
-		)
-
-		// Patch the object, ignoring conflicts on the conditions owned by this controller
-		patchOpts := []patch.Option{
-			patch.WithOwnedConditions{
-				Conditions: []string{
-					sourcev1.ArtifactUnavailableCondition,
-					sourcev1.SourceVerifiedCondition,
-					sourcev1.FetchFailedCondition,
-					sourcev1.IncludeUnavailableCondition,
-					sourcev1.ArtifactOutdatedCondition,
-					meta.ReadyCondition,
-					meta.ReconcilingCondition,
-					meta.StalledCondition,
-				},
-			},
-		}
-
-		// Determine if the resource is still being reconciled, or if it has stalled, and record this observation
-		if retErr == nil && (result.IsZero() || !result.Requeue) {
-			// We are no longer reconciling
-			conditions.Delete(obj, meta.ReconcilingCondition)
-
-			// We have now observed this generation
-			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
-
-			readyCondition := conditions.Get(obj, meta.ReadyCondition)
-			switch readyCondition.Status {
-			case metav1.ConditionFalse:
-				// As we are no longer reconciling and the end-state is not ready, the reconciliation has stalled
-				conditions.MarkStalled(obj, readyCondition.Reason, readyCondition.Message)
-			case metav1.ConditionTrue:
-				// As we are no longer reconciling and the end-state is ready, the reconciliation is no longer stalled
-				conditions.Delete(obj, meta.StalledCondition)
-			}
-		}
-
-		// Finally, patch the resource
-		if err := patchHelper.Patch(ctx, obj, patchOpts...); err != nil {
-			// Ignore patch error "not found" when the object is being deleted.
-			if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
-				err = kerrors.FilterOut(err, func(e error) bool { return apierrors.IsNotFound(e) })
-			}
-			retErr = kerrors.NewAggregate([]error{retErr, err})
-		}
+		retErr = r.summarizeAndPatch(ctx, obj, patchHelper, recResult, retErr)
 
 		// Always record readiness and duration metrics
 		r.Metrics.RecordReadiness(ctx, obj)
@@ -188,55 +133,150 @@ func (r *GitRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// between init and delete
 	if !controllerutil.ContainsFinalizer(obj, sourcev1.SourceFinalizer) {
 		controllerutil.AddFinalizer(obj, sourcev1.SourceFinalizer)
+		recResult = sreconcile.ResultRequeue
 		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Examine if the object is under deletion
 	if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, obj)
+		res, err := r.reconcileDelete(ctx, obj)
+		return sreconcile.BuildRuntimeResult(obj, res, err)
 	}
 
 	// Reconcile actual object
-	return r.reconcile(ctx, obj)
+	reconcilers := []gitRepoReconcilerFunc{
+		r.reconcileStorage,
+		r.reconcileSource,
+		r.reconcileInclude,
+		r.reconcileArtifact,
+	}
+	recResult, err = r.reconcile(ctx, obj, reconcilers)
+	return sreconcile.BuildRuntimeResult(obj, recResult, err)
 }
 
-// reconcile steps through the actual reconciliation tasks for the object, it returns early on the first step that
-// produces an error.
-func (r *GitRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.GitRepository) (ctrl.Result, error) {
-	// Mark the resource as under reconciliation
-	conditions.MarkReconciling(obj, meta.ProgressingReason, "")
-
-	// Reconcile the storage data
-	if result, err := r.reconcileStorage(ctx, obj); err != nil || result.IsZero() {
-		return result, err
+// summarizeAndPatch analyzes the object conditions to create a summary of the
+// status conditions and patches the object with the calculated summary.
+func (r *GitRepositoryReconciler) summarizeAndPatch(ctx context.Context, obj *sourcev1.GitRepository, patchHelper *patch.Helper, res sreconcile.Result, recErr error) error {
+	// Remove reconciling condition on successful reconciliation.
+	if recErr == nil && res == sreconcile.ResultSuccess {
+		conditions.Delete(obj, meta.ReconcilingCondition)
 	}
+
+	// Record the value of the reconciliation request if any.
+	if v, ok := meta.ReconcileAnnotationValue(obj.GetAnnotations()); ok {
+		obj.Status.SetLastHandledReconcileRequest(v)
+	}
+
+	// Summarize the Ready condition based on abnormalities that may have been observed.
+	conditions.SetSummary(obj,
+		meta.ReadyCondition,
+		conditions.WithConditions(
+			sourcev1.IncludeUnavailableCondition,
+			sourcev1.SourceVerifiedCondition,
+			sourcev1.FetchFailedCondition,
+			sourcev1.ArtifactOutdatedCondition,
+			meta.ReconcilingCondition,
+		),
+		conditions.WithNegativePolarityConditions(
+			sourcev1.FetchFailedCondition,
+			sourcev1.IncludeUnavailableCondition,
+			sourcev1.ArtifactOutdatedCondition,
+			meta.ReconcilingCondition,
+		),
+	)
+
+	// Patch the object, ignoring conflicts on the conditions owned by this controller
+	patchOpts := []patch.Option{
+		patch.WithOwnedConditions{
+			Conditions: []string{
+				sourcev1.SourceVerifiedCondition,
+				sourcev1.FetchFailedCondition,
+				sourcev1.IncludeUnavailableCondition,
+				sourcev1.ArtifactOutdatedCondition,
+				meta.ReadyCondition,
+				meta.ReconcilingCondition,
+				meta.StalledCondition,
+			},
+		},
+	}
+
+	// Analyze the reconcile error.
+	switch t := recErr.(type) {
+	case *serror.StallingError:
+		if res == sreconcile.ResultEmpty {
+			// The current generation has been reconciled successfully and it has
+			// resulted in a stalled state. Return no error to stop further
+			// requeuing.
+			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
+			conditions.MarkFalse(obj, meta.ReadyCondition, t.Reason, t.Error())
+			conditions.MarkStalled(obj, t.Reason, t.Error())
+			recErr = nil
+		}
+		// ?: Log when there's a stalling error and non-empty result? This
+		// indicates incorrect returned values.
+	case nil:
+		// The reconciliation didn't result in any error, we are not in stalled
+		// state. If a requeue is requested, the current generation has not been
+		// reconciled successfully.
+		if res != sreconcile.ResultRequeue {
+			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
+		}
+		conditions.Delete(obj, meta.StalledCondition)
+	default:
+		// The reconcile resulted in some error, but we are not in stalled
+		// state.
+		conditions.Delete(obj, meta.StalledCondition)
+	}
+
+	if err := patchHelper.Patch(ctx, obj, patchOpts...); err != nil {
+		// Ignore patch error "not found" when the object is being deleted.
+		if !obj.ObjectMeta.DeletionTimestamp.IsZero() {
+			err = kerrors.FilterOut(err, func(e error) bool { return apierrors.IsNotFound(e) })
+		}
+		recErr = kerrors.NewAggregate([]error{recErr, err})
+	}
+
+	return recErr
+}
+
+// reconcile steps iterates through the actual reconciliation tasks for objec,
+// it returns early on the first step that returns ResultRequeue or produces an
+// error.
+func (r *GitRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.GitRepository, reconcilers []gitRepoReconcilerFunc) (sreconcile.Result, error) {
+	if obj.Generation != obj.Status.ObservedGeneration {
+		conditions.MarkReconciling(obj, "NewGeneration", "Reconciling new generation %d", obj.Generation)
+	}
+
+	var artifact sourcev1.Artifact
+	var includes artifactSet
 
 	// Create temp dir for Git clone
 	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("%s-%s-%s-", obj.Kind, obj.Namespace, obj.Name))
 	if err != nil {
-		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason, "Failed to create temporary directory: %s", err)
-		return ctrl.Result{}, err
+		ctrl.LoggerFrom(ctx).Error(err, "failed to create temporary directory")
+		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
+			"Failed to create temporary directory: %s", err)
+		return sreconcile.ResultEmpty, err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Reconcile the source from upstream
-	var artifact sourcev1.Artifact
-	if result, err := r.reconcileSource(ctx, obj, &artifact, tmpDir); err != nil || result.IsZero() {
-		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, err
+	// Run the sub-reconcilers and build the result of reconciliation.
+	var res sreconcile.Result
+	var resErr error
+	for _, rec := range reconcilers {
+		recResult, err := rec(ctx, obj, &artifact, &includes, tmpDir)
+		// Exit immediately on ResultRequeue.
+		if recResult == sreconcile.ResultRequeue {
+			return sreconcile.ResultRequeue, nil
+		}
+		// Prioritize requeue request in the result.
+		res = sreconcile.LowestRequeuingResult(res, recResult)
+		if err != nil {
+			resErr = err
+			break
+		}
 	}
-
-	// Reconcile includes from the storage
-	var includes artifactSet
-	if result, err := r.reconcileInclude(ctx, obj, tmpDir); err != nil || result.IsZero() {
-		return ctrl.Result{RequeueAfter: r.requeueDependency}, err
-	}
-
-	// Reconcile the artifact to storage
-	if result, err := r.reconcileArtifact(ctx, obj, artifact, includes, tmpDir); err != nil || result.IsZero() {
-		return result, err
-	}
-
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return res, resErr
 }
 
 // reconcileStorage ensures the current state of the storage matches the desired and previously observed state.
@@ -245,9 +285,7 @@ func (r *GitRepositoryReconciler) reconcile(ctx context.Context, obj *sourcev1.G
 // If the artifact in the Status object of the resource disappeared from storage, it is removed from the object.
 // If the object does not have an artifact in its Status object, a v1beta1.ArtifactUnavailableCondition is set.
 // If the hostname of any of the URLs on the object do not match the current storage server hostname, they are updated.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
-func (r *GitRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sourcev1.GitRepository) (ctrl.Result, error) {
+func (r *GitRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, includes *artifactSet, dir string) (sreconcile.Result, error) {
 	// Garbage collect previous advertised artifact(s) from storage
 	_ = r.garbageCollect(ctx, obj)
 
@@ -259,17 +297,16 @@ func (r *GitRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sou
 
 	// Record that we do not have an artifact
 	if obj.GetArtifact() == nil {
-		conditions.MarkTrue(obj, sourcev1.ArtifactUnavailableCondition, "NoArtifact", "No artifact for resource in storage")
-		return ctrl.Result{Requeue: true}, nil
+		conditions.MarkReconciling(obj, "NoArtifact", "No artifact for resource in storage")
+		return sreconcile.ResultSuccess, nil
 	}
-	conditions.Delete(obj, sourcev1.ArtifactUnavailableCondition)
 
 	// Always update URLs to ensure hostname is up-to-date
 	// TODO(hidde): we may want to send out an event only if we notice the URL has changed
 	r.Storage.SetArtifactURL(obj.GetArtifact())
 	obj.Status.URL = r.Storage.SetHostname(obj.Status.URL)
 
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileSource ensures the upstream Git repository can be reached and checked out using the declared configuration,
@@ -283,10 +320,8 @@ func (r *GitRepositoryReconciler) reconcileStorage(ctx context.Context, obj *sou
 // signature can not be verified or the verification fails, the Condition=False and it returns early.
 // If both the checkout and signature verification are successful, the given artifact pointer is set to a new artifact
 // with the available metadata.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
 func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
-	obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, dir string) (ctrl.Result, error) {
+	obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, includes *artifactSet, dir string) (sreconcile.Result, error) {
 	// Configure authentication strategy to access the source
 	var authOpts *git.AuthOptions
 	var err error
@@ -303,7 +338,7 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 			r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.AuthenticationFailedReason,
 				"Failed to get secret '%s': %s", name.String(), err.Error())
 			// Return error as the world as observed may change
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 
 		// Configure strategy with secret
@@ -318,7 +353,7 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.AuthenticationFailedReason,
 			"Failed to configure auth strategy for Git implementation '%s': %s", obj.Spec.GitImplementation, err)
 		// Return error as the contents of the secret may change
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Configure checkout strategy
@@ -336,7 +371,7 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 		conditions.MarkTrue(obj, sourcev1.FetchFailedCondition, sourcev1.GitOperationFailedReason,
 			"Failed to configure checkout strategy for Git implementation '%s': %s", obj.Spec.GitImplementation, err)
 		// Do not return err as recovery without changes is impossible
-		return ctrl.Result{}, nil
+		return sreconcile.ResultEmpty, &serror.StallingError{Err: err, Reason: sourcev1.GitOperationFailedReason}
 	}
 
 	// Checkout HEAD of reference in object
@@ -349,14 +384,14 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.GitOperationFailedReason,
 			"Failed to checkout and determine revision: %s", err)
 		// Coin flip on transient or persistent error, return error and hope for the best
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	r.Eventf(ctx, obj, events.EventSeverityInfo, sourcev1.GitOperationSucceedReason,
 		"Cloned repository '%s' and checked out revision '%s'", obj.Spec.URL, commit.String())
 	conditions.Delete(obj, sourcev1.FetchFailedCondition)
 
 	// Verify commit signature
-	if result, err := r.verifyCommitSignature(ctx, obj, *commit); err != nil || result.IsZero() {
+	if result, err := r.verifyCommitSignature(ctx, obj, *commit); err != nil || result == sreconcile.ResultEmpty {
 		return result, err
 	}
 
@@ -365,9 +400,11 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 
 	// Mark observations about the revision on the object
 	if !obj.GetArtifact().HasRevision(commit.String()) {
-		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "NewRevision", "New upstream revision '%s'", commit.String())
+		message := fmt.Sprintf("New upstream revision '%s'", commit.String())
+		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "NewRevision", message)
+		conditions.MarkReconciling(obj, "NewRevision", message)
 	}
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileArtifact archives a new artifact to the storage, if the current observation on the object does not match the
@@ -379,14 +416,9 @@ func (r *GitRepositoryReconciler) reconcileSource(ctx context.Context,
 // Source ignore patterns are loaded, and the given directory is archived.
 // On a successful archive, the artifact and includes in the status of the given object are set, and the symlink in the
 // storage is updated to its path.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
-func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *sourcev1.GitRepository, artifact sourcev1.Artifact, includes artifactSet, dir string) (ctrl.Result, error) {
+func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, includes *artifactSet, dir string) (sreconcile.Result, error) {
 	// Always restore the Ready condition in case it got removed due to a transient error
 	defer func() {
-		if obj.GetArtifact() != nil {
-			conditions.Delete(obj, sourcev1.ArtifactUnavailableCondition)
-		}
 		if obj.GetArtifact().HasRevision(artifact.Revision) && !includes.Diff(obj.Status.IncludedArtifacts) {
 			conditions.Delete(obj, sourcev1.ArtifactOutdatedCondition)
 			conditions.MarkTrue(obj, meta.ReadyCondition, meta.SucceededReason,
@@ -397,27 +429,33 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 	// The artifact is up-to-date
 	if obj.GetArtifact().HasRevision(artifact.Revision) && !includes.Diff(obj.Status.IncludedArtifacts) {
 		ctrl.LoggerFrom(ctx).Info(fmt.Sprintf("Already up to date, current revision '%s'", artifact.Revision))
-		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+		return sreconcile.ResultSuccess, nil
 	}
+
+	// Mark reconciling because the artifact and remote source are different.
+	// and they have to be reconciled.
+	conditions.MarkReconciling(obj, "NewRevision", "New upstream revision '%s'", artifact.Revision)
 
 	// Ensure target path exists and is a directory
 	if f, err := os.Stat(dir); err != nil {
 		err = fmt.Errorf("failed to stat target path: %w", err)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	} else if !f.IsDir() {
 		err = fmt.Errorf("invalid target path: '%s' is not a directory", dir)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Ensure artifact directory exists and acquire lock
-	if err := r.Storage.MkdirAll(artifact); err != nil {
+	if err := r.Storage.MkdirAll(*artifact); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "failed to create temporary directory")
 		err = fmt.Errorf("failed to create artifact directory: %w", err)
-		return ctrl.Result{}, err
+		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason, err.Error())
+		return sreconcile.ResultEmpty, err
 	}
-	unlock, err := r.Storage.Lock(artifact)
+	unlock, err := r.Storage.Lock(*artifact)
 	if err != nil {
 		err = fmt.Errorf("failed to acquire lock for artifact: %w", err)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	defer unlock()
 
@@ -426,17 +464,17 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 	if err != nil {
 		r.Eventf(ctx, obj, events.EventSeverityError,
 			"SourceIgnoreError", "Failed to load source ignore patterns from repository: %s", err)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	if obj.Spec.Ignore != nil {
 		ps = append(ps, sourceignore.ReadPatterns(strings.NewReader(*obj.Spec.Ignore), nil)...)
 	}
 
 	// Archive directory to storage
-	if err := r.Storage.Archive(&artifact, dir, SourceIgnoreFilter(ps, nil)); err != nil {
+	if err := r.Storage.Archive(artifact, dir, SourceIgnoreFilter(ps, nil)); err != nil {
 		r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
 			"Unable to archive artifact to storage: %s", err)
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 	r.Events.EventWithMetaf(ctx, obj, map[string]string{
 		"revision": artifact.Revision,
@@ -445,10 +483,10 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 
 	// Record it on the object
 	obj.Status.Artifact = artifact.DeepCopy()
-	obj.Status.IncludedArtifacts = includes
+	obj.Status.IncludedArtifacts = *includes
 
 	// Update symlink on a "best effort" basis
-	url, err := r.Storage.Symlink(artifact, "latest.tar.gz")
+	url, err := r.Storage.Symlink(*artifact, "latest.tar.gz")
 	if err != nil {
 		r.Events.Eventf(ctx, obj, events.EventSeverityError, sourcev1.StorageOperationFailedReason,
 			"Failed to update status URL symlink: %s", err)
@@ -456,7 +494,7 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 	if url != "" {
 		obj.Status.URL = url
 	}
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileInclude reconciles the declared includes from the object by copying their artifact (sub)contents to the
@@ -465,9 +503,7 @@ func (r *GitRepositoryReconciler) reconcileArtifact(ctx context.Context, obj *so
 // If an include is unavailable, it marks the object with v1beta1.IncludeUnavailableCondition and returns early.
 // If the copy operations are successful, it deletes the v1beta1.IncludeUnavailableCondition from the object.
 // If the artifactSet differs from the current set, it marks the object with v1beta1.ArtifactOutdatedCondition.
-//
-// The caller should assume a failure if an error is returned, or the Result is zero.
-func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sourcev1.GitRepository, dir string) (ctrl.Result, error) {
+func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sourcev1.GitRepository, artifact *sourcev1.Artifact, includes *artifactSet, dir string) (sreconcile.Result, error) {
 	artifacts := make(artifactSet, len(obj.Spec.Include))
 	for i, incl := range obj.Spec.Include {
 		// Do this first as it is much cheaper than copy operations
@@ -475,7 +511,7 @@ func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sou
 		if err != nil {
 			conditions.MarkTrue(obj, sourcev1.IncludeUnavailableCondition, "IllegalPath",
 				"Path calculation for include '%s' failed: %s", incl.GitRepositoryRef.Name, err.Error())
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 
 		// Retrieve the included GitRepository
@@ -483,15 +519,16 @@ func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sou
 		if err := r.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: incl.GitRepositoryRef.Name}, dep); err != nil {
 			conditions.MarkTrue(obj, sourcev1.IncludeUnavailableCondition, "NotFound",
 				"Could not get resource for include '%s': %s", incl.GitRepositoryRef.Name, err.Error())
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 
 		// Confirm include has an artifact
 		if dep.GetArtifact() == nil {
-			ctrl.LoggerFrom(ctx).Error(nil, fmt.Sprintf("No artifact available for include '%s'", incl.GitRepositoryRef.Name))
+			message := fmt.Sprintf("No artifact available for include '%s'", incl.GitRepositoryRef.Name)
+			ctrl.LoggerFrom(ctx).Error(nil, message)
 			conditions.MarkTrue(obj, sourcev1.IncludeUnavailableCondition, "NoArtifact",
 				"No artifact available for include '%s'", incl.GitRepositoryRef.Name)
-			return ctrl.Result{}, nil
+			return sreconcile.ResultEmpty, &serror.StallingError{Err: fmt.Errorf(message), Reason: "NoArtifact"}
 		}
 
 		// Copy artifact (sub)contents to configured directory
@@ -500,7 +537,7 @@ func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sou
 				"Failed to copy '%s' include from %s to %s: %s", incl.GitRepositoryRef.Name, incl.GetFromPath(), incl.GetToPath(), err.Error())
 			r.Eventf(ctx, obj, events.EventSeverityError, sourcev1.IncludeUnavailableCondition,
 				"Failed to copy '%s' include from %s to %s: %s", incl.GitRepositoryRef.Name, incl.GetFromPath(), incl.GetToPath(), err.Error())
-			return ctrl.Result{}, err
+			return sreconcile.ResultEmpty, err
 		}
 		artifacts[i] = dep.GetArtifact().DeepCopy()
 	}
@@ -510,33 +547,36 @@ func (r *GitRepositoryReconciler) reconcileInclude(ctx context.Context, obj *sou
 
 	// Observe if the artifacts still match the previous included ones
 	if artifacts.Diff(obj.Status.IncludedArtifacts) {
-		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "IncludeChange", "Included artifacts differ from last observed includes")
+		conditions.MarkTrue(obj, sourcev1.ArtifactOutdatedCondition, "IncludeChange",
+			"Included artifacts differ from last observed includes")
 	}
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	return sreconcile.ResultSuccess, nil
 }
 
 // reconcileDelete handles the delete of an object. It first garbage collects all artifacts for the object from the
 // artifact storage, if successful, the finalizer is removed from the object.
-func (r *GitRepositoryReconciler) reconcileDelete(ctx context.Context, obj *sourcev1.GitRepository) (ctrl.Result, error) {
+// func (r *GitRepositoryReconciler) reconcileDelete(ctx context.Context, obj *sourcev1.GitRepository) (ctrl.Result, error) {
+func (r *GitRepositoryReconciler) reconcileDelete(ctx context.Context, obj *sourcev1.GitRepository) (sreconcile.Result, error) {
 	// Garbage collect the resource's artifacts
 	if err := r.garbageCollect(ctx, obj); err != nil {
 		// Return the error so we retry the failed garbage collection
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
 	// Remove our finalizer from the list
 	controllerutil.RemoveFinalizer(obj, sourcev1.SourceFinalizer)
 
 	// Stop reconciliation as the object is being deleted
-	return ctrl.Result{}, nil
+	return sreconcile.ResultEmpty, nil
 }
 
 // verifyCommitSignature verifies the signature of the given commit if a verification mode is configured on the object.
-func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj *sourcev1.GitRepository, commit git.Commit) (ctrl.Result, error) {
+// func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj *sourcev1.GitRepository, commit git.Commit) (ctrl.Result, error) {
+func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj *sourcev1.GitRepository, commit git.Commit) (sreconcile.Result, error) {
 	// Check if there is a commit verification is configured and remove any old observations if there is none
 	if obj.Spec.Verification == nil || obj.Spec.Verification.Mode == "" {
 		conditions.Delete(obj, sourcev1.SourceVerifiedCondition)
-		return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+		return sreconcile.ResultSuccess, nil
 	}
 
 	// Get secret with GPG data
@@ -546,9 +586,11 @@ func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj
 	}
 	secret := &corev1.Secret{}
 	if err := r.Client.Get(ctx, publicKeySecret, secret); err != nil {
-		conditions.MarkFalse(obj, sourcev1.SourceVerifiedCondition, meta.FailedReason, "PGP public keys secret error: %s", err.Error())
-		r.Eventf(ctx, obj, events.EventSeverityError, "VerificationError", "PGP public keys secret error: %s", err.Error())
-		return ctrl.Result{}, err
+		conditions.MarkFalse(obj, sourcev1.SourceVerifiedCondition, meta.FailedReason,
+			"PGP public keys secret error: %s", err.Error())
+		r.Eventf(ctx, obj, events.EventSeverityError, "VerificationError",
+			"PGP public keys secret error: %s", err.Error())
+		return sreconcile.ResultEmpty, err
 	}
 
 	var keyRings []string
@@ -557,15 +599,19 @@ func (r *GitRepositoryReconciler) verifyCommitSignature(ctx context.Context, obj
 	}
 	// Verify commit with GPG data from secret
 	if _, err := commit.Verify(keyRings...); err != nil {
-		conditions.MarkFalse(obj, sourcev1.SourceVerifiedCondition, meta.FailedReason, "Signature verification of commit '%s' failed: %s", commit.Hash.String(), err)
-		r.Eventf(ctx, obj, events.EventSeverityError, "InvalidCommitSignature", "Signature verification of commit '%s' failed: %s", commit.Hash.String(), err)
+		conditions.MarkFalse(obj, sourcev1.SourceVerifiedCondition, meta.FailedReason,
+			"Signature verification of commit '%s' failed: %s", commit.Hash.String(), err)
+		r.Eventf(ctx, obj, events.EventSeverityError, "InvalidCommitSignature",
+			"Signature verification of commit '%s' failed: %s", commit.Hash.String(), err)
 		// Return error in the hope the secret changes
-		return ctrl.Result{}, err
+		return sreconcile.ResultEmpty, err
 	}
 
-	conditions.MarkTrue(obj, sourcev1.SourceVerifiedCondition, meta.SucceededReason, "Verified signature of commit '%s'", commit.Hash.String())
-	r.Eventf(ctx, obj, events.EventSeverityInfo, "VerifiedCommit", "Verified signature of commit '%s'", commit.Hash.String())
-	return ctrl.Result{RequeueAfter: obj.GetRequeueAfter()}, nil
+	conditions.MarkTrue(obj, sourcev1.SourceVerifiedCondition, meta.SucceededReason,
+		"Verified signature of commit '%s'", commit.Hash.String())
+	r.Eventf(ctx, obj, events.EventSeverityInfo, "VerifiedCommit",
+		"Verified signature of commit '%s'", commit.Hash.String())
+	return sreconcile.ResultSuccess, nil
 }
 
 // garbageCollect performs a garbage collection for the given v1beta1.GitRepository. It removes all but the current
@@ -586,11 +632,13 @@ func (r *GitRepositoryReconciler) garbageCollect(ctx context.Context, obj *sourc
 	}
 	if obj.GetArtifact() != nil {
 		if err := r.Storage.RemoveAllButCurrent(*obj.GetArtifact()); err != nil {
-			r.Eventf(ctx, obj, events.EventSeverityError, "GarbageCollectionFailed", "Garbage collection of old artifacts failed: %s", err)
+			r.Eventf(ctx, obj, events.EventSeverityError, "GarbageCollectionFailed",
+				"Garbage collection of old artifacts failed: %s", err)
 			return err
 		}
 		// TODO(hidde): we should only push this event if we actually garbage collected something
-		r.Eventf(ctx, obj, events.EventSeverityInfo, "GarbageCollectionSucceeded", "Garbage collected old artifacts")
+		r.Eventf(ctx, obj, events.EventSeverityInfo, "GarbageCollectionSucceeded",
+			"Garbage collected old artifacts")
 	}
 	return nil
 }
